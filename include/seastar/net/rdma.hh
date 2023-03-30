@@ -17,6 +17,7 @@
  */
 /*
  * Copyright Futurewei Technologies Inc, 2020
+ * Copyright Justin Funston 2023
  */
 
 #pragma once
@@ -34,21 +35,12 @@
 #include <seastar/core/sstring.hh>
 
 #include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+#include <sys/socket.h>
 
-bool operator==(const union ibv_gid& lhs, const union ibv_gid& rhs);
 namespace seastar { namespace rdma { class EndPoint; }}
 
 namespace std {
-
-template <>
-struct hash<union ibv_gid>
-{
-    std::size_t operator()(const union ibv_gid& gid) const {
-        size_t half1 = *(size_t*)gid.raw;
-        size_t half2 = *(size_t*)(gid.raw + 8);
-        return std::hash<unsigned long long>{}((unsigned long long)(half1 ^ half2));
-    }
-};
 
 template <>
 struct hash<seastar::rdma::EndPoint> {
@@ -63,10 +55,6 @@ namespace rdma {
 class RDMAStack;
 class RDMAListener;
 typedef temporary_buffer<char> Buffer;
-
-// Opens the RDMA device context, which is shared by all cores/RDMAStacks. The verbs API
-// is thread safe so sharing it is ok. Should only be called once at program start
-int initRDMAContext(const std::string& RDMADeviceName);
 
 struct RecvWRData {
     static constexpr int maxWR = 256;
@@ -88,33 +76,13 @@ struct SendWRData {
     SendWRData& operator=(SendWRData&&) = default;
 };
 
-struct UDSend {
-    Buffer buffer;
-    struct ibv_ah* AH;
-    uint32_t destQP;
-    UDSend (Buffer&& buf, struct ibv_ah* ah, uint32_t qp) :
-        buffer(std::move(buf)), AH(ah), destQP(qp) {}
-    UDSend() = delete;
-};
-
 struct EndPoint {
-    union ibv_gid GID;
-    uint32_t UDQP;
-    EndPoint(union ibv_gid gid, uint32_t qp) :
-        GID(gid), UDQP(qp) {}
-    EndPoint(const sstring& strGID, uint32_t qp): GID{0}, UDQP(0) {
-        union ibv_gid gid{0};
-        if (StringToGID(strGID, gid) == 0) {
-            GID = gid;
-            UDQP = qp;
-        }
-    }
+   struct sockaddr_in addr;
+    EndPoint(struct sockaddr a) :
+        addr(a) {}
+
     EndPoint() = default;
-    bool operator==(const EndPoint& rhs) const {
-        return (GID == rhs.GID) && (UDQP == rhs.UDQP);
-    }
-    static sstring GIDToString(union ibv_gid gid);
-    static int StringToGID(const sstring& strGID, union ibv_gid& result);
+    bool operator==(const EndPoint& rhs) const = default;
 };
 
 class RDMAConnection : public weakly_referencable<RDMAConnection> {
@@ -201,49 +169,16 @@ public:
 
     static constexpr uint32_t RCDataSize = 8192;
 private:
-    // The RDMA GID determines the IP address and version to use, and the RoCE version to use.
-    // For more info see: https://community.mellanox.com/s/article/howto-configure-roce-on-connectx-4
-    uint8_t gidIndex;
+    struct rdma_cm_event* connection_queue = nullptr;
+    struct rdma_cm_id* listen_id = nullptr;
+
     std::optional<reactor::poller> RDMAPoller;
     struct ibv_pd* protectionDomain = nullptr;
     struct ibv_mr* memRegionHandle = nullptr;
-    struct ibv_qp* UDQP = nullptr;
-    struct ibv_cq* UDCQ = nullptr;
 
-    enum class UDOps : uint32_t {
-        HandshakeRequest,
-        HandshakeResponse,
-    };
-    struct UDMessage {
-        UDOps op;
-        union ibv_gid GID;
-        uint32_t QPNum;
-        uint32_t requestId;
-    };
-    // There is a 40 byte overhead for incoming UD messages
-    // The first 40 bytes contains headers that indicate the source of the message
-    static constexpr uint32_t UDDataOffset = 40;
-    static constexpr size_t UDQPRxSize = sizeof(UDMessage) + 40;
-    RecvWRData UDQPRRs;
-    SendWRData UDQPSRs;
-    std::array<Buffer, SendWRData::maxWR> UDOutstandingBuffers;
-    std::deque<UDSend> UDSendQueue;
-
-    int sendUDQPMessage(Buffer buffer, const union ibv_gid& GID, uint32_t destQP);
-    int trySendUDQPMessage(const Buffer& buffer, struct ibv_ah* AH, uint32_t destQP);
-    void processUDMessage(UDMessage*, EndPoint);
-    void sendHandshakeResponse(const EndPoint& endpoint, uint32_t QPNum, uint32_t requestId);
-    uint32_t sendHandshakeRequest(const EndPoint& endpoint, uint32_t QPNum);
-    int handshakeId = 0;
-    bool processUDSendQueue();
-    bool processUDCQ();
+    bool pollConnectionQueue();
     static void processCompletedSRs(std::array<Buffer, SendWRData::maxWR>& buffers, SendWRData& WRData, uint64_t signaledID);
     static constexpr int pollBatchSize = 16;
-
-    void fillAHAttr(struct ibv_ah_attr& AHAttr, const union ibv_gid& GID);
-    std::unordered_map<union ibv_gid, struct ibv_ah*> AHLookup;
-    std::unordered_map<int, weak_ptr<RDMAConnection>> handshakeLookup;
-    static std::unique_ptr<RDMAStack> makeUDQP(std::unique_ptr<RDMAStack> stack);
 
     static constexpr int maxExpectedConnections = 1024;
     static constexpr int RCCQSize = RecvWRData::maxWR +
@@ -261,8 +196,6 @@ private:
     bool acceptPromiseActive = false;
     promise<std::unique_ptr<RDMAConnection>> acceptPromise;
     std::deque<std::unique_ptr<RDMAConnection>> acceptQueue;
-
-    future<struct ibv_ah*> getAH(const union ibv_gid& GID);
 
     // For metrics
     uint64_t totalRecv=0;

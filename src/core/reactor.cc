@@ -2716,9 +2716,9 @@ int reactor::run() {
        _signals.handle_signal_once(SIGTERM, [this] { stop(); });
     }
 
-    if (smp::_rdma_device != "") {
+    if (smp::_rdma_ip != "") {
         _rdma_stack = rdma::RDMAStack::makeRDMAStack(memory::getMemRegionStart(), memory::getMemRegionSize(),
-                                                        smp::_rdma_gid);
+                                                        smp::_rdma_ip, smp::_rdma_port);
         if (!_rdma_stack) {
             fmt::print("warning: failed to initialize rdma stack\n");
         }
@@ -3430,8 +3430,8 @@ std::unique_ptr<smp_message_queue*[], smp::qs_deleter> smp::_qs;
 std::thread::id smp::_tmain;
 unsigned smp::count = 1;
 bool smp::_using_dpdk;
-std::string smp::_rdma_device;
-uint8_t smp::_rdma_gid;
+std::string smp::_rdma_ip;
+uint16_t smp::_rdma_port;
 
 void smp::start_all_queues()
 {
@@ -3746,8 +3746,8 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
 #ifdef SEASTAR_HAVE_DPDK
     _using_dpdk = configuration.count("dpdk-pmd");
 #endif
-    _rdma_device = configuration["rdma"].as<std::string>();
-    _rdma_gid = configuration["rdma_gid"].as<uint8_t>();
+    _rdma_device = configuration["rdma_ip"].as<std::string>();
+    _rdma_port = configuration["rdma_port"].as<uint16_t>();
     auto thread_affinity = configuration["thread-affinity"].as<bool>();
     if (configuration.count("overprovisioned")
            && configuration["thread-affinity"].defaulted()) {
@@ -3897,10 +3897,6 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         dpdk::eal::init(cpus, configuration);
     }
 #endif
-
-    if (smp::_rdma_device != "") {
-        rdma::initRDMAContext(smp::_rdma_device);
-    }
 
     // Better to put it into the smp class, but at smp construction time
     // correct smp::count is not known.

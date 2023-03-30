@@ -309,8 +309,8 @@ public:
     static void join_all();
     static bool main_thread() { return std::this_thread::get_id() == _tmain; }
 
-    static std::string _rdma_device;
-    static uint8_t _rdma_gid;
+    static std::string _rdma_ip;
+    static uint16_t _rdma_port;
 
     /// Runs a function on a remote core.
     ///
