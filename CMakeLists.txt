@@ -367,6 +367,7 @@ find_package (Threads REQUIRED)
 find_package (PthreadSetName REQUIRED)
 
 find_library(VERBS ibverbs REQUIRED)
+find_library(RDMACM_LIBRARY rdmacm REQUIRED)
 
 #
 # Code generation helpers.
@@ -741,7 +742,7 @@ target_include_directories (seastar
 set (Seastar_PRIVATE_CXX_FLAGS
   -fvisibility=hidden
   -UNDEBUG
-  -Wall
+  -Wno-deprecated-declarations
   -Wno-array-bounds # Disabled because of https://gcc.gnu.org/bugzilla/show_bug.cgi?id=93437
   -Wno-error=deprecated-declarations)
 
@@ -770,6 +771,7 @@ target_link_libraries (seastar
     rt::rt
     yaml-cpp::yaml-cpp
     "${VERBS}"
+    "${RDMACM_LIBRARY}"
     Threads::Threads)
 
 set (Seastar_SANITIZE_MODES "Debug" "Sanitize")

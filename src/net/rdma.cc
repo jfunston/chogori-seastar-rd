@@ -17,6 +17,7 @@
  */
 /*
  * Copyright Futurewei Technologies Inc, 2020
+ * Portions Copyright Justin Funston 2023
  */
 
 #include <iostream>
@@ -43,23 +44,13 @@ namespace seastar {
 
 namespace rdma {
 
-future<> RDMAConnection::makeQP() {
-    // A Reliable Connected (RC) QP has five states:
-    // RESET: the state of a newly created QP
-    // INIT: Receive requests can be posted, but no receives or
-    //       sends will occur
-    // RTR: Ready-to-receive. Receives can be completed
-    // RTS: Ready-to-send. Sends can be posted and completed
-    // ERR: Error state.
-    // To use a RC QP, the states must be transitioned in order:
-    // RESET->INIT->RTR->RTS using ibv_modify_qp without skipping states
-    // see the ibv_modify_qp documentation for more info
+void RDMAStack::handleConnectionRequest(struct rdma_cm_id* id) {
 
     struct ibv_qp_init_attr init_attr = {
         .qp_context = nullptr,
-        .send_cq = stack->RCCQ,
-        .recv_cq = stack->RCCQ,
-        .srq = stack->SRQ,
+        .send_cq = RCCQ,
+        .recv_cq = RCCQ,
+        .srq = SRQ,
         .cap = {
             .max_send_wr = SendWRData::maxWR,
             .max_recv_wr = RecvWRData::maxWR,
@@ -70,55 +61,32 @@ future<> RDMAConnection::makeQP() {
         .sq_sig_all = 0
     };
 
-    return engine()._thread_pool->submit<struct ibv_qp*>([init_attr, PD=stack->protectionDomain]() mutable {
+    // No need to do any state management at this point, it is handled for us by the cm through the id.
+    // We will get either a connection established event or an error event after this.
+    (void) engine()._thread_pool->submit<int>([id, init_attr, pd=protectionDomain]() mutable {
         // Create QP
-        // For all ll ibv_* calls with attr (attribute) parameters, the attr is passed by pointer because
+        // For all ibv_* calls with attr (attribute) parameters, the attr is passed by pointer because
         // it is a C interface, but the struct does not need to live beyond the ibv_ call.
-        struct ibv_qp* QP = ibv_create_qp(PD, &init_attr);
-        if (!QP) {
+
+       int ret = rdma_create_qp(id, pd, &init_attr);
+       if (ret) {
             K2ERROR("Failed to create RC QP: " << strerror(errno));
-            return QP;
-        }
+            rdma_destroy_id(id);
+	        return 0;
+       }
 
-        // Transition QP to INIT state
-        struct ibv_qp_attr attr = {};
-        attr.qp_state = IBV_QPS_INIT;
-        attr.port_num = 1;
-        if (int err = ibv_modify_qp(QP, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                                               IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-            K2ERROR("failed to transition RC QP into init state: " << strerror(err));
-            ibv_destroy_qp(QP);
-            QP = nullptr;
-            return QP;
-        }
+       struct rdma_conn_param params;
+       memset(&params, 0, sizeof(struct rdma_conn_param));
+       params.rnr_retry_count = 7;
+       ret = rdma_accept(id, &params);
+       if (ret) {
+            K2ERROR("rdma_accept failed: " << strerror(errno));
+            rdma_destroy_qp(id);
+            rdma_destroy_id(id);
+	        return 0;
+       }
 
-        return QP;
-    }).
-    then([conn=weak_from_this()] (struct ibv_qp* newQP) {
-        if (!conn) {
-            if (newQP) {
-                ibv_destroy_qp(newQP);
-            }
-            return;
-        }
-
-        if (!newQP) {
-            conn->shutdownConnection();
-            return;
-        }
-
-        conn->QP = newQP;
-        if (conn->stack->RCConnectionCount+1 > RDMAStack::maxExpectedConnections) {
-            K2WARN("CQ overrun possible");
-        }
-        conn->stack->RCLookup[conn->QP->qp_num] = conn->weak_from_this();
-    }).
-    handle_exception([conn=weak_from_this()] (auto e) {
-        if (!conn) {
-            return;
-        }
-
-        conn->shutdownConnection();
+       return 0;
     });
 }
 
@@ -320,19 +288,23 @@ void RDMAConnection::shutdownConnection() {
         K2WARN("Shutting down RC QP with pending sends");
     }
 
-    if (QP) {
-        (void) engine()._thread_pool->submit<int>([QP=this->QP]() {
+    if (ID) {
+        (void) engine()._thread_pool->submit<int>([ID=this->ID]() {
             // Transitioning the QP into the Error state will flush
             // any outstanding WRs, possibly with errors. Is needed to
             // maintain consistency in the SRQ
             struct ibv_qp_attr attr = {};
             attr.qp_state = IBV_QPS_ERR;
 
-            ibv_modify_qp(QP, &attr, IBV_QP_STATE);
-            ibv_destroy_qp(QP);
+            if (ID->qp) {
+                ibv_modify_qp(ID->qp, &attr, IBV_QP_STATE);
+                rdma_destroy_qp(ID);
+            }
+            rdma_destroy_id(ID);
 
             return 0;
         });
+        ID = nullptr;
         QP = nullptr;
     }
 
@@ -360,6 +332,10 @@ RDMAStack::~RDMAStack() {
         }
     }
 
+    if (listen_id) {
+        rdma_destroy_id(listen_id);
+    }
+
     if (memRegionHandle) {
         ibv_dereg_mr(memRegionHandle);
         memRegionHandle = nullptr;
@@ -375,8 +351,6 @@ RDMAStack::~RDMAStack() {
     }
 
     for (int i=0; i<RecvWRData::maxWR; ++i) {
-        struct ibv_sge& SG = UDQPRRs.Segments[i];
-        free((void*)SG.addr);
         struct ibv_sge& SRQSG = RCQPRRs.Segments[i];
         free((void*)SRQSG.addr);
     }
@@ -412,7 +386,87 @@ future<std::unique_ptr<RDMAConnection>> RDMAStack::accept() {
 
 std::unique_ptr<RDMAConnection> RDMAStack::connect(const EndPoint& remote) {
     std::unique_ptr<RDMAConnection> conn = std::make_unique<RDMAConnection>(this, remote);
-    conn->makeHandshakeRequest();
+
+    struct ibv_qp_init_attr init_attr = {
+        .qp_context = nullptr,
+        .send_cq = RCCQ,
+        .recv_cq = RCCQ,
+        .srq = SRQ,
+        .cap = {
+            .max_send_wr = SendWRData::maxWR,
+            .max_recv_wr = RecvWRData::maxWR,
+            .max_send_sge = 1,
+            .max_recv_sge = 1,
+            .max_inline_data = 0},
+        .qp_type = IBV_QPT_RC,
+        .sq_sig_all = 0
+    };
+    
+    (void) engine()._thread_pool->submit<int>([init_attr, pd=protectionDomain, conn=conn->weak_from_this()]() mutable {
+        if (!conn) {
+            return -1;
+        }
+
+        // NOTE this is not using the event channel, connection operations are synchronous here on the slow thread
+        struct rdma_cm_id *id;
+        int ret = rdma_create_id(nullptr, &id, nullptr, RDMA_PS_TCP);
+        if (ret) {
+            K2WARN("rdma_create_id error: " << strerror(errno));
+            return ret;
+        }
+        conn->ID = id;
+
+        // TODO need to change port of localEndpoint?
+        ret = rdma_resolve_addr(id, (struct sockaddr*) &(conn->stack->localEndpoint.addr), (struct sockaddr*)&(conn->remote.addr), 1000);
+        if (ret) {
+            K2WARN("rdma_resolve_addr error: " << strerror(errno));
+            return ret;
+        }
+
+        ret = rdma_resolve_route(id, 1000);
+        if (ret) {
+            K2WARN("rdma_resolve_route error: " << strerror(errno));
+            return ret;
+        }
+
+        ret = rdma_create_qp(id, pd, &init_attr);
+        if (ret) {
+            K2WARN("rdma_create_qp error: " << strerror(errno));
+            return ret;
+        }
+        conn->QP = id->qp;
+
+        struct rdma_conn_param params;
+        memset(&params, 0, sizeof(struct rdma_conn_param));
+        params.rnr_retry_count = 7;
+        ret = rdma_connect(id, &params);
+        if (ret) {
+            K2WARN("rdma_connect error: " << strerror(errno));
+            return ret;
+        }
+
+        return 0;
+    }).
+    then([this, conn=conn->weak_from_this()] (int err) {
+        if (!conn) {
+            return;
+        }
+
+        if (err) {
+            conn->shutdownConnection();
+            return;
+        }
+
+        RCLookup[conn->QP->qp_num] = conn->weak_from_this();
+        conn->isReady = true;
+        ++RCConnectionCount;
+
+        // Flush send queue
+        size_t beforeSize = conn->sendQueue.size();
+        conn->processSends<std::deque<Buffer>>(conn->sendQueue);
+        sendQueueSize -= beforeSize - conn->sendQueue.size();
+    });
+
     return conn;
 }
 
@@ -511,8 +565,35 @@ bool RDMAStack::processRCCQ() {
 
 }
 
+void RDMAStack::shutdownConnectionEvent(struct rdma_cm_id* id) {
+    if (!id) {
+        return;
+    }
+
+    auto connIt = IDLookup.find(id);
+    if (connIt != IDLookup.end() && connIt->second) {
+        connIt->second->shutdownConnection();
+        return;
+    }
+    else if (connIt != IDLookup.end() && !connIt->second) {
+        IDLookup.erase(connIt);
+    }
+
+    if (id->qp) {
+        auto qpIt = RCLookup.find(id->qp->qp_num);
+        if (qpIt != RCLookup.end() && qpIt->second) {
+            qpIt->second->shutdownConnection();
+        }
+        else if (qpIt != RCLookup.end() && !qpIt->second) {
+            RCLookup.erase(qpIt);
+        }
+    }
+}
+
 bool RDMAStack::pollConnectionQueue() {
     struct rdma_cm_event *cm_event;
+    // NOTE this code is setup to handle async events from the active side of a connection
+    // but that is not currently in use, all active connections are done synchronously (on slow thread)
 
     while(true) {
         int ret = rdma_get_cm_event(connection_queue, &cm_event);
@@ -524,23 +605,70 @@ bool RDMAStack::pollConnectionQueue() {
 
         if (cm_event->status) {
             K2WARN("RDMA connection event error: " << strerror(cm_event->status));
+            shutdownConnectionEvent(cm_event->id);
             rdma_ack_cm_event(cm_event);
             continue;
         }
 
         if (cm_event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-        // TODO create QP, then accept
+            handleConnectionRequest(cm_event->id);
         }
         else if (cm_event->event == RDMA_CM_EVENT_ESTABLISHED) {
+            auto connIt = IDLookup.find(cm_event->id);
+            if (connIt != IDLookup.end() && !connIt->second) {
+                // Upper layers dropped connection before establishment, just remove from our map
+                // Destructor of RDMAConnection will handle resource freeing
+                IDLookup.erase(connIt);
+            }
+            else if (connIt != IDLookup.end()) {
+                // This was the active side of the connection
+                connIt->second->isReady = true;
+                ++RCConnectionCount;
+
+                // Flush send queue
+                size_t beforeSize = connIt->second->sendQueue.size();
+                connIt->second->processSends<std::deque<Buffer>>(connIt->second->sendQueue);
+                sendQueueSize -= beforeSize - connIt->second->sendQueue.size();
+               
+                // We can find this connectio by QP num now, can delete from IDLookup 
+                IDLookup.erase(connIt);
+            }
+            else {
+                // This was the passive side of connection, need to create RDMAConnection and fulfill accept promise
+                struct sockaddr_in remote_sockaddr;
+	            memcpy(&remote_sockaddr, rdma_get_peer_addr(cm_event->id), sizeof(struct sockaddr_in));
+                EndPoint remote(remote_sockaddr);
+
+                // Setup RDMAConnection
+                auto conn = std::make_unique<RDMAConnection>(this, remote);
+                conn->ID = cm_event->id;
+                conn->QP = cm_event->id->qp;
+                conn->isReady = true;
+                RCLookup[conn->QP->qp_num] = conn->weak_from_this();
+
+                // Fulfill accept
+                if (acceptPromiseActive) {
+                    acceptPromiseActive = false;
+                    acceptPromise.set_value(std::move(conn));
+                } else {
+                    acceptQueue.push_back(std::move(conn));
+                }
+            }
         }
-        else if (cm_event->event == RDMA_CM_EVENT_REJECTED || cm_event->event == RDMA_CM_EVENT_CONNECT_ERROR) {
+        else if (cm_event->event == RDMA_CM_EVENT_REJECTED || cm_event->event == RDMA_CM_EVENT_CONNECT_ERROR || 
+                 cm_event->event == RDMA_CM_EVENT_ADDR_ERROR || cm_event->event == RDMA_CM_EVENT_ROUTE_ERROR) {
+            K2WARN("RDMA bad connection event");
+            shutdownConnectionEvent(cm_event->id);
         }
         else if (cm_event->event == RDMA_CM_EVENT_DISCONNECTED) {
+            shutdownConnectionEvent(cm_event->id);
         }
 
         // Other events we ack but otherwise ignore
         rdma_ack_cm_event(cm_event);
     }
+
+    return true;
 }
 
 bool RDMAStack::poller() {
@@ -614,7 +742,7 @@ std::unique_ptr<RDMAStack> RDMAStack::makeRDMAStack(void* memRegion, size_t memR
 
 
     stack->connection_queue = rdma_create_event_channel();
-    if (!cm_event_channel) {
+    if (!stack->connection_queue) {
         K2ERROR("Failed to create event channel: " << strerror(errno));
         return nullptr;
     }
@@ -667,7 +795,7 @@ std::unique_ptr<RDMAStack> RDMAStack::makeRDMAStack(void* memRegion, size_t memR
         return nullptr;
     }
 
-    stack->localEndpoint = Endpoint(local_sock);
+    stack->localEndpoint = EndPoint(local_sock);
 
     stack->RCCQ = ibv_create_cq(stack->listen_id->verbs, RCCQSize, nullptr, nullptr, 0);
     if (!stack->RCCQ) {

@@ -3746,7 +3746,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
 #ifdef SEASTAR_HAVE_DPDK
     _using_dpdk = configuration.count("dpdk-pmd");
 #endif
-    _rdma_device = configuration["rdma_ip"].as<std::string>();
+    _rdma_ip = configuration["rdma_ip"].as<std::string>();
     _rdma_port = configuration["rdma_port"].as<uint16_t>();
     auto thread_affinity = configuration["thread-affinity"].as<bool>();
     if (configuration.count("overprovisioned")

@@ -78,11 +78,13 @@ struct SendWRData {
 
 struct EndPoint {
    struct sockaddr_in addr;
-    EndPoint(struct sockaddr a) :
+    EndPoint(struct sockaddr_in a) :
         addr(a) {}
 
     EndPoint() = default;
-    bool operator==(const EndPoint& rhs) const = default;
+    bool operator==(const EndPoint& rhs) const {
+        return addr.sin_addr.s_addr == rhs.addr.sin_addr.s_addr && addr.sin_port == rhs.addr.sin_port;
+    }
 };
 
 class RDMAConnection : public weakly_referencable<RDMAConnection> {
@@ -132,6 +134,7 @@ private:
     void sendCloseSignal();
 
     struct ibv_qp* QP = nullptr;
+    struct rdma_cm_id* ID = nullptr;
     RDMAStack* stack = nullptr;
     EndPoint remote;
 
@@ -140,11 +143,6 @@ private:
 
     bool recvPromiseActive = false;
     promise<Buffer> recvPromise;
-
-    future<> makeQP();
-    void makeHandshakeRequest();
-    future<> completeHandshake(uint32_t remoteQP);
-    void processHandshakeRequest(uint32_t remoteQP, uint32_t responseId);
 
     void shutdownConnection();
 
@@ -160,7 +158,7 @@ public:
     future<std::unique_ptr<RDMAConnection>> accept();
     std::unique_ptr<RDMAConnection> connect(const EndPoint& remote);
 
-    static std::unique_ptr<RDMAStack> makeRDMAStack(void* memRegion, size_t memRegionSize, uint8_t gid_index);
+    static std::unique_ptr<RDMAStack> makeRDMAStack(void* memRegion, size_t memRegionSize, std::string local_ip, uint16_t local_port);
     RDMAStack() = default;
     ~RDMAStack() noexcept;
 
@@ -169,7 +167,7 @@ public:
 
     static constexpr uint32_t RCDataSize = 8192;
 private:
-    struct rdma_cm_event* connection_queue = nullptr;
+    struct rdma_event_channel* connection_queue = nullptr;
     struct rdma_cm_id* listen_id = nullptr;
 
     std::optional<reactor::poller> RDMAPoller;
@@ -177,6 +175,8 @@ private:
     struct ibv_mr* memRegionHandle = nullptr;
 
     bool pollConnectionQueue();
+    void handleConnectionRequest(struct rdma_cm_id*);
+    void shutdownConnectionEvent(struct rdma_cm_id*);
     static void processCompletedSRs(std::array<Buffer, SendWRData::maxWR>& buffers, SendWRData& WRData, uint64_t signaledID);
     static constexpr int pollBatchSize = 16;
 
@@ -187,6 +187,8 @@ private:
     struct ibv_cq* RCCQ = nullptr;
     struct ibv_srq* SRQ = nullptr;
     std::unordered_map<uint32_t, weak_ptr<RDMAConnection>> RCLookup;
+    // Used during connection setup to translate between id ptr and RDMAConnection
+    std::unordered_map<struct rdma_cm_id *, weak_ptr<RDMAConnection>> IDLookup;
     bool processRCCQ();
     int RCConnectionCount = 0;
 
