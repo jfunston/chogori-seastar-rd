@@ -3337,8 +3337,8 @@ reactor::get_options_description(reactor_config cfg) {
                 "idle polling time in microseconds (reduce for overprovisioned environments or laptops)")
         ("poll-aio", bpo::value<bool>()->default_value(true),
                 "busy-poll for disk I/O (reduces latency and increases throughput)")
-        ("rdma", bpo::value<std::string>()->default_value(""), "Enable the rdma network stack with the specified rdma device name")
-        ("rdma_gid", bpo::value<uint8_t>()->default_value(3), "Specify RDMA GID index to use. Default 3, which is the ROCEv2 over IPv4 GID on Mellanox ConnectX 4 and 5")
+        ("rdma_ip", bpo::value<std::string>()->default_value(""), "Enable the rdma network stack with the specified rdma listen IP")
+        ("rdma_port", bpo::value<uint16_t>()->default_value(0), "Specify RDMA listen port")
         ("task-quota-ms", bpo::value<double>()->default_value(cfg.task_quota / 1ms), "Max time (ms) between polls")
         ("max-task-backlog", bpo::value<unsigned>()->default_value(1000), "Maximum number of task backlog to allow; above this we ignore I/O")
         ("blocked-reactor-notify-ms", bpo::value<unsigned>()->default_value(200), "threshold in miliseconds over which the reactor is considered blocked if no progress is made")

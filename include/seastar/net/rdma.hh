@@ -187,8 +187,8 @@ private:
     struct ibv_cq* RCCQ = nullptr;
     struct ibv_srq* SRQ = nullptr;
     std::unordered_map<uint32_t, weak_ptr<RDMAConnection>> RCLookup;
-    // Used during connection setup to translate between id ptr and RDMAConnection
-    std::unordered_map<struct rdma_cm_id *, weak_ptr<RDMAConnection>> IDLookup;
+    // Used during connection setup to determine if a connection established event is for the passive side
+    std::unordered_set<struct rdma_cm_id *> PassiveLookup;
     bool processRCCQ();
     int RCConnectionCount = 0;
 

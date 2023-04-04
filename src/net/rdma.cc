@@ -416,8 +416,10 @@ std::unique_ptr<RDMAConnection> RDMAStack::connect(const EndPoint& remote) {
         }
         conn->ID = id;
 
-        // TODO need to change port of localEndpoint?
-        ret = rdma_resolve_addr(id, (struct sockaddr*) &(conn->stack->localEndpoint.addr), (struct sockaddr*)&(conn->remote.addr), 1000);
+        struct sockaddr_in local_addr;
+        memcpy(&local_addr, &(conn->stack->localEndpoint.addr), sizeof(struct sockaddr_in));
+        local_addr.sin_port = 0;
+        ret = rdma_resolve_addr(id, (struct sockaddr*) &local_addr, (struct sockaddr*)&(conn->remote.addr), 1000);
         if (ret) {
             K2WARN("rdma_resolve_addr error: " << strerror(errno));
             return ret;
@@ -570,13 +572,10 @@ void RDMAStack::shutdownConnectionEvent(struct rdma_cm_id* id) {
         return;
     }
 
-    auto connIt = IDLookup.find(id);
-    if (connIt != IDLookup.end() && connIt->second) {
-        connIt->second->shutdownConnection();
+    auto connIt = PassiveLookup.find(id);
+    if (connIt != PassiveLookup.end()) {
+        PassiveLookup.erase(connIt);
         return;
-    }
-    else if (connIt != IDLookup.end() && !connIt->second) {
-        IDLookup.erase(connIt);
     }
 
     if (id->qp) {
@@ -612,31 +611,29 @@ bool RDMAStack::pollConnectionQueue() {
 
         if (cm_event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
             handleConnectionRequest(cm_event->id);
+            PassiveLookup.insert(cm_event->id);
         }
         else if (cm_event->event == RDMA_CM_EVENT_ESTABLISHED) {
-            auto connIt = IDLookup.find(cm_event->id);
-            if (connIt != IDLookup.end() && !connIt->second) {
-                // Upper layers dropped connection before establishment, just remove from our map
-                // Destructor of RDMAConnection will handle resource freeing
-                IDLookup.erase(connIt);
-            }
-            else if (connIt != IDLookup.end()) {
-                // This was the active side of the connection
-                connIt->second->isReady = true;
-                ++RCConnectionCount;
+            auto IdIt = PassiveLookup.find(cm_event->id);
 
-                // Flush send queue
-                size_t beforeSize = connIt->second->sendQueue.size();
-                connIt->second->processSends<std::deque<Buffer>>(connIt->second->sendQueue);
-                sendQueueSize -= beforeSize - connIt->second->sendQueue.size();
-               
-                // We can find this connectio by QP num now, can delete from IDLookup 
-                IDLookup.erase(connIt);
+            if (IdIt == PassiveLookup.end()) {
+                // This was the active side of the connection
+                auto& conn = RCLookup[cm_event->id->qp->qp_num];
+                if (conn) {
+                    conn->isReady = true;
+                    ++RCConnectionCount;
+
+                    // Flush send queue
+                    size_t beforeSize = conn->sendQueue.size();
+                    conn->processSends<std::deque<Buffer>>(conn->sendQueue);
+                    sendQueueSize -= beforeSize - conn->sendQueue.size();
+                }
             }
             else {
                 // This was the passive side of connection, need to create RDMAConnection and fulfill accept promise
                 struct sockaddr_in remote_sockaddr;
 	            memcpy(&remote_sockaddr, rdma_get_peer_addr(cm_event->id), sizeof(struct sockaddr_in));
+                remote_sockaddr.sin_port = rdma_get_dst_port(cm_event->id);
                 EndPoint remote(remote_sockaddr);
 
                 // Setup RDMAConnection
@@ -645,6 +642,7 @@ bool RDMAStack::pollConnectionQueue() {
                 conn->QP = cm_event->id->qp;
                 conn->isReady = true;
                 RCLookup[conn->QP->qp_num] = conn->weak_from_this();
+                PassiveLookup.erase(IdIt);
 
                 // Fulfill accept
                 if (acceptPromiseActive) {
