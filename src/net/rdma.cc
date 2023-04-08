@@ -74,6 +74,7 @@ void RDMAStack::handleConnectionRequest(struct rdma_cm_id* id) {
             rdma_destroy_id(id);
 	        return 0;
        }
+       K2INFO("rdma_create_qp on request done: " << id->qp->qp_num);
 
        struct rdma_conn_param params;
        memset(&params, 0, sizeof(struct rdma_conn_param));
@@ -85,6 +86,8 @@ void RDMAStack::handleConnectionRequest(struct rdma_cm_id* id) {
             rdma_destroy_id(id);
 	        return 0;
        }
+
+       K2INFO("rdma_accept done: " << id->qp->qp_num);
 
        return 0;
     });
@@ -446,6 +449,7 @@ std::unique_ptr<RDMAConnection> RDMAStack::connect(const EndPoint& remote) {
             K2WARN("rdma_connect error: " << strerror(errno));
             return ret;
         }
+        K2INFO("rdma_connect success for qp: " << conn->QP->qp_num);
 
         return 0;
     }).
@@ -459,6 +463,7 @@ std::unique_ptr<RDMAConnection> RDMAStack::connect(const EndPoint& remote) {
             return;
         }
 
+        K2INFO("adding to RCLookup: " << conn->QP->qp_num);
         RCLookup[conn->QP->qp_num] = conn->weak_from_this();
         conn->isReady = true;
         ++RCConnectionCount;
@@ -467,6 +472,8 @@ std::unique_ptr<RDMAConnection> RDMAStack::connect(const EndPoint& remote) {
         size_t beforeSize = conn->sendQueue.size();
         conn->processSends<std::deque<Buffer>>(conn->sendQueue);
         sendQueueSize -= beforeSize - conn->sendQueue.size();
+
+        K2INFO("flushed sends after connect: " << conn->QP->qp_num);
     });
 
     return conn;
@@ -610,10 +617,12 @@ bool RDMAStack::pollConnectionQueue() {
         }
 
         if (cm_event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
+            K2INFO("EVENT_CONNECT_REQUEST");
             handleConnectionRequest(cm_event->id);
             PassiveLookup.insert(cm_event->id);
         }
         else if (cm_event->event == RDMA_CM_EVENT_ESTABLISHED) {
+            K2INFO("EVENT_ESTABLISHED");
             auto IdIt = PassiveLookup.find(cm_event->id);
 
             if (IdIt == PassiveLookup.end()) {
@@ -630,6 +639,7 @@ bool RDMAStack::pollConnectionQueue() {
                 }
             }
             else {
+                K2INFO("EVENT_ESTABLISHED passive");
                 // This was the passive side of connection, need to create RDMAConnection and fulfill accept promise
                 struct sockaddr_in remote_sockaddr;
 	            memcpy(&remote_sockaddr, rdma_get_peer_addr(cm_event->id), sizeof(struct sockaddr_in));
